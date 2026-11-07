@@ -8,26 +8,68 @@
 #include "dm_input.h"
 #include <stdlib.h>
 
-typedef struct pro_device { IOHIDDeviceRef hid; uint8_t report[512]; pro_motion motion; struct pro_device *next; } pro_device;
+typedef struct pro_device { IOHIDDeviceRef hid; uint32_t pid; uint8_t report[512]; pro_motion motion; struct pro_device *next; } pro_device;
 static IOHIDManagerRef g_pro_manager;
 static pro_device *g_pro_devices, *g_pro_bound;
 static int g_pro_player = -1, g_pro_active = 1, g_pro_controllers, g_pro_slot = -1;
 static int g_pro_seen_devices = -1, g_pro_seen_controllers = -1;
 static void (*g_pro_changed)(void);
 
+// Custom (local patch, not upstream): Joy-Cons speak the same 0x30 report as a Pro Controller, so the passive reader
+// works for them too. A paired set is two HID devices (0x2006 left, 0x2007 right) behind ONE GCController, which the
+// Pro rule below rejects. Pick a single IMU source per controller instead: the right Joy-Con (0x2007), whose IMU is the
+// one a single-IMU game expects, else a left Joy-Con alone, else the one Pro.
+static pro_device *pro_pick(void) {
+    pro_device *right = NULL, *left = NULL, *pro = NULL;
+    int n = 0;
+    for (pro_device *d = g_pro_devices; d; d = d->next) {
+        n++;
+        if (!right && d->pid == 0x2007) right = d;
+        else if (!left && d->pid == 0x2006) left = d;
+        else if (!pro && d->pid == 0x2009) pro = d;
+    }
+    if (g_pro_controllers != 1) return NULL;                 // as before: one controller to bind the samples to
+    if (right || left) return right ? right : left;          // one Joy-Con pair: its right half drives the IMU
+    return n == 1 ? pro : NULL;                              // otherwise the Pro rule, unchanged
+}
 static void pro_route(void) {
     int n = 0; for (pro_device *d = g_pro_devices; d; d = d->next) n++;
     int p = pro_motion_player(n, g_pro_controllers, g_pro_slot);
-    pro_device *d = p >= 0 ? g_pro_devices : NULL;
+    pro_device *d = p >= 0 ? pro_pick() : NULL;
+    if (p >= 0 && !d) p = -1;
     if (p < 0 && n && g_pro_controllers && (n != g_pro_seen_devices || g_pro_controllers != g_pro_seen_controllers))
         LOG("[hid] Pro Controller raw motion: %d HID devices / %d controllers; cannot pair them uniquely, keeping GameController motion", n, g_pro_controllers);
     g_pro_seen_devices = n; g_pro_seen_controllers = g_pro_controllers;
     if (d == g_pro_bound && p == g_pro_player) return;
     if (g_pro_player >= 0) dm_motion_clear_hid(g_pro_player);
     g_pro_bound = d; g_pro_player = p;
-    if (d) { d->motion = (pro_motion){0}; LOG("[hid] Pro Controller raw motion: player %d (passive HID 0x30)", p + 1); }
+    if (d) { d->motion = (pro_motion){0}; LOG("[hid] Pro Controller raw motion: player %d (passive HID 0x30, pid %04x)", p + 1, d->pid); }
 }
 static void dm_motion_pro_players(int controllers, int slot) { g_pro_controllers = controllers; g_pro_slot = slot; pro_route(); }
+
+// Custom (local patch, not upstream): a Joy-Con's IMU is OFF until told otherwise, and a pad a Switch has used can keep it
+// off, so every 0x30 report carries six zero axes (measured: 680 reports, zero non-zero samples). The console sends
+// subcommand 0x40 {0x01} to switch it on; nxnative never did. Output report 0x01 = counter, neutral rumble, subcommand,
+// argument. Resent every 2 s while the samples stay zero, at most 5 times, as MacNativeGames does (a pad drops
+// subcommands sent back to back).
+static uint8_t g_pro_counter[8];
+static uint64_t g_pro_imu_tried;
+static int g_pro_imu_retries;
+static void pro_imu_on(pro_device *d) {
+    if (!d || d->pid == 0x2009) return;                    // a Pro's IMU is already on (it streams real samples)
+    if (g_pro_imu_retries >= 5) return;
+    uint64_t now = now_ns();
+    if (g_pro_imu_tried && now - g_pro_imu_tried < 2000000000ull) return;
+    g_pro_imu_tried = now; g_pro_imu_retries++;
+    uint8_t out[49] = {0x01};
+    out[1] = (uint8_t)(g_pro_imu_retries & 0x0f);          // packet counter
+    out[3] = 0x40; out[4] = 0x40;                          // neutral rumble, both sides
+    out[6] = 0x40; out[7] = 0x40;
+    out[8] = 0x40; out[9] = 0x01;                          // subcommand 0x40, IMU on
+    IOReturn e = IOHIDDeviceSetReport(d->hid, kIOHIDReportTypeOutput, out[0], out, sizeof out);
+    LOG("[hid] Joy-Con raw motion: IMU-on subcommand sent (%d of 5)%s", g_pro_imu_retries,
+        e == kIOReturnSuccess ? "" : " — write failed");
+}
 static void dm_motion_pro_active(int active) {
     g_pro_active = active;
     if (g_pro_bound) g_pro_bound->motion = (pro_motion){0};
@@ -36,9 +78,12 @@ static void dm_motion_pro_active(int active) {
 static void pro_report(void *ctx, IOReturn result, void *sender, IOHIDReportType type, uint32_t report_id, uint8_t *r, CFIndex len) {
     (void)sender;
     pro_device *d = ctx;
-    if (result != kIOReturnSuccess || type != kIOHIDReportTypeInput || report_id != 0x30 || len < 0 || !g_pro_active || d != g_pro_bound) return;
+    if (result != kIOReturnSuccess || type != kIOHIDReportTypeInput || report_id != 0x30 || len < 49 || !g_pro_active || d != g_pro_bound) return;
     pro_motion_sample samples[3];
+    int64_t before = d->motion.live;
     int n = pro_motion_decode(&d->motion, r, (size_t)len, now_ns(), samples);
+    if (!before && !d->motion.live) { pro_imu_on(d); return; }   // six zero axes: the Joy-Con's IMU is off; ask for it
+    if (!before && d->motion.live) g_pro_imu_retries = 0;        // real samples now: stop resending
     for (int i = 0; i < n; i++) dm_motion_set_hid(g_pro_player, samples[i].acc, samples[i].rot, samples[i].ns);
 }
 static void pro_found(void *ctx, IOReturn result, void *sender, IOHIDDeviceRef hid) {
@@ -46,7 +91,9 @@ static void pro_found(void *ctx, IOReturn result, void *sender, IOHIDDeviceRef h
     if (result != kIOReturnSuccess || IOHIDDeviceGetProperty(hid, CFSTR(kIOHIDGCSyntheticDeviceKey)) == kCFBooleanTrue) return;
     for (pro_device *d = g_pro_devices; d; d = d->next) if (d->hid == hid) return;
     pro_device *d = calloc(1, sizeof *d); if (!d) { LOG("[RED] Pro Controller raw motion: cannot allocate device state"); return; }
-    d->hid = (IOHIDDeviceRef)CFRetain(hid); d->next = g_pro_devices; g_pro_devices = d;
+    d->hid = (IOHIDDeviceRef)CFRetain(hid);
+    d->pid = ((NSNumber *)IOHIDDeviceGetProperty(hid, CFSTR(kIOHIDProductIDKey))).unsignedIntValue;
+    d->next = g_pro_devices; g_pro_devices = d;
     IOHIDDeviceRegisterInputReportCallback(hid, d->report, sizeof d->report, pro_report, d);
     if (g_pro_changed) g_pro_changed();
 }
@@ -66,7 +113,11 @@ static void dm_motion_pro_start(void (*changed)(void)) {
     e = getenv("DM_MOTION_HID"); if (e && !atoi(e)) return;
     g_pro_changed = changed;
     g_pro_manager = IOHIDManagerCreate(kCFAllocatorDefault, kIOHIDOptionsTypeNone); if (!g_pro_manager) return;
-    IOHIDManagerSetDeviceMatching(g_pro_manager, (__bridge CFDictionaryRef)@{@kIOHIDVendorIDKey: @0x057E, @kIOHIDProductIDKey: @0x2009});
+    IOHIDManagerSetDeviceMatchingMultiple(g_pro_manager, (__bridge CFArrayRef)@[
+        @{@kIOHIDVendorIDKey: @0x057E, @kIOHIDProductIDKey: @0x2009},   // Pro Controller (and pads that present as one, e.g. the IINE)
+        @{@kIOHIDVendorIDKey: @0x057E, @kIOHIDProductIDKey: @0x2006},   // Joy-Con (L)
+        @{@kIOHIDVendorIDKey: @0x057E, @kIOHIDProductIDKey: @0x2007},   // Joy-Con (R)
+    ]);
     IOHIDManagerRegisterDeviceMatchingCallback(g_pro_manager, pro_found, NULL);
     IOHIDManagerRegisterDeviceRemovalCallback(g_pro_manager, pro_removed, NULL);
     IOHIDManagerScheduleWithRunLoop(g_pro_manager, CFRunLoopGetMain(), kCFRunLoopCommonModes);

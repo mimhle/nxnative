@@ -211,9 +211,15 @@ static void pad_keep_system_buttons(GCController *c) {
 }
 static const char *pad_name(GCController *c) { return c.vendorName.UTF8String ?: "?"; }
 static void npad_name(int p, char *out, size_t cap) { uint32_t id = dm_player_npad(p); if (id == 0x20) snprintf(out, cap, "handheld"); else snprintf(out, cap, "%u", id); }
+// Custom (local patch, not upstream): "Joy-Con (L/R)" is counted too, so the passive HID IMU reader is offered to a
+// Joy-Con pair. macOS reports their GCMotion as zeroes (#296) like a Pro's, so the raw path is the only working source.
+static int is_switch_motion_pad(GCController *c) {
+    NSString *cat = c.productCategory;
+    return [cat isEqualToString:@"Switch Pro Controller"] || [cat hasPrefix:@"Joy-Con"];
+}
 static void pro_players_changed(GCController *gone) {
     int count = 0, player = -1;
-    for (GCController *c in GCController.controllers) if (c != gone && c.extendedGamepad && [c.productCategory isEqualToString:@"Switch Pro Controller"]) {
+    for (GCController *c in GCController.controllers) if (c != gone && c.extendedGamepad && is_switch_motion_pad(c)) {
         count++; player = g_merge ? 0 : pad_slot_of(&g_slots, (__bridge const void *)c);
     }
     dm_motion_pro_players(count, player);

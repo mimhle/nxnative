@@ -11,3 +11,6 @@ dm/games/*/cb_extent.tsv
 .coverage
 .coverage.*
 /coverage.json
+
+# Our local notes, docs and probes - never commit (kept in ~/switch-mac-notes)
+local/
